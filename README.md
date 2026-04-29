@@ -160,8 +160,7 @@ Doctor-Sahab-Backend/
 
 - `userId`, `docId`, `slotDate`, `slotTime`
 - `userData`, `docData`, `amount`
-- `cancelled`, `payment`, `iscompleted`
-- `roomId`, `videoCallLink` (for video consultations)
+- `cancelled`, `iscompleted`
 
 ## Scripts
 

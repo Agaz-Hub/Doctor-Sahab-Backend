@@ -5,6 +5,170 @@ import jwt from "jsonwebtoken";
 import { v2 as cloudinary } from "cloudinary";
 import doctorModel from "../models/doctorModel.js";
 import appointmentModel from "../models/appointmentModel.js";
+import { getSeverityAndTimeBlock } from "../ai/severityScorer.js";
+import {
+  calculateQueueSlot,
+  isPastDate,
+  normalizeDoctorShifts,
+  parseHHMMToMinutes,
+} from "../utils/shiftScheduler.js";
+import { getSchedulerTriage } from "../utils/medicalSchedulerClient.js";
+
+const pickQueuePositionForTime = (appointments, slotTime) => {
+  const targetMins = parseHHMMToMinutes(slotTime);
+  if (targetMins === null) return (appointments || []).length + 1;
+
+  const sorted = [...(appointments || [])].sort((a, b) => {
+    const aMins = parseHHMMToMinutes(a.slotTime) ?? Number.MAX_SAFE_INTEGER;
+    const bMins = parseHHMMToMinutes(b.slotTime) ?? Number.MAX_SAFE_INTEGER;
+    return aMins - bMins;
+  });
+
+  const index = sorted.findIndex((item) => {
+    const mins = parseHHMMToMinutes(item.slotTime);
+    return mins !== null && targetMins < mins;
+  });
+
+  return index === -1 ? sorted.length + 1 : index + 1;
+};
+
+const canFitPreferredTime = ({
+  shift,
+  existingAppointments,
+  slotTime,
+  durationMinutes,
+}) => {
+  const startMinutes = parseHHMMToMinutes(shift.startTime);
+  const endMinutes = parseHHMMToMinutes(shift.endTime);
+  const slotMinutes = parseHHMMToMinutes(slotTime);
+
+  if (startMinutes === null || endMinutes === null || slotMinutes === null) {
+    return false;
+  }
+
+  const duration = Number(durationMinutes) > 0 ? Number(durationMinutes) : 20;
+  if (slotMinutes < startMinutes || slotMinutes + duration > endMinutes) {
+    return false;
+  }
+
+  return !(existingAppointments || []).some((appointment) => {
+    const existingStart = parseHHMMToMinutes(appointment.slotTime);
+    if (existingStart === null) return false;
+    const existingDuration = Number(appointment.durationMinutes) || 20;
+    const existingEnd = existingStart + existingDuration;
+    const targetEnd = slotMinutes + duration;
+    return slotMinutes < existingEnd && targetEnd > existingStart;
+  });
+};
+
+const parseSlotDateValue = (slotDate) => {
+  if (!slotDate || typeof slotDate !== "string") return null;
+  const trimmed = slotDate.trim();
+
+  if (/^\d{1,2}_\d{1,2}_\d{4}$/.test(trimmed)) {
+    const [day, month, year] = trimmed.split("_").map(Number);
+    return new Date(year, month - 1, day);
+  }
+
+  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(trimmed)) {
+    const [year, month, day] = trimmed.split("-").map(Number);
+    return new Date(year, month - 1, day);
+  }
+
+  if (
+    /^\d{1,2}-\d{1,2}-\d{4}$/.test(trimmed) ||
+    /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(trimmed)
+  ) {
+    const [day, month, year] = trimmed.split(/[-/]/).map(Number);
+    return new Date(year, month - 1, day);
+  }
+
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+};
+
+const parseSlotTimeValue = (slotTime) => {
+  if (!slotTime || typeof slotTime !== "string") {
+    return { hours: 0, minutes: 0 };
+  }
+
+  const trimmed = slotTime.trim();
+  const amPmMatch = trimmed.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (amPmMatch) {
+    let hours = Number(amPmMatch[1]);
+    const minutes = Number(amPmMatch[2]);
+    const meridiem = amPmMatch[3].toUpperCase();
+    if (meridiem === "PM" && hours !== 12) hours += 12;
+    if (meridiem === "AM" && hours === 12) hours = 0;
+    return { hours, minutes };
+  }
+
+  const hhmmMatch = trimmed.match(/^(\d{1,2}):(\d{2})$/);
+  if (hhmmMatch) {
+    return { hours: Number(hhmmMatch[1]), minutes: Number(hhmmMatch[2]) };
+  }
+
+  return { hours: 0, minutes: 0 };
+};
+
+const parseAppointmentDateTime = (slotDate, slotTime) => {
+  const baseDate = parseSlotDateValue(slotDate);
+  if (!baseDate) return null;
+  const { hours, minutes } = parseSlotTimeValue(slotTime);
+
+  return new Date(
+    baseDate.getFullYear(),
+    baseDate.getMonth(),
+    baseDate.getDate(),
+    hours,
+    minutes,
+    0,
+    0,
+  );
+};
+
+const getDurationMinutes = (appointment) => {
+  const parsed = Number(appointment?.durationMinutes);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
+};
+
+const getAppointmentWindow = (appointment) => {
+  const start = parseAppointmentDateTime(
+    appointment?.slotDate,
+    appointment?.slotTime,
+  );
+  if (!start) return { start: null, end: null };
+  const end = new Date(
+    start.getTime() + getDurationMinutes(appointment) * 60000,
+  );
+  return { start, end };
+};
+
+const cancelMissedAppointmentsForUser = async (userId) => {
+  const now = new Date();
+  const appointments = await appointmentModel.find({
+    userId,
+    cancelled: false,
+    iscompleted: false,
+  });
+
+  const idsToCancel = [];
+  appointments.forEach((item) => {
+    const { end } = getAppointmentWindow(item);
+    if (!end) return;
+    if (now > end) {
+      idsToCancel.push(item._id);
+    }
+  });
+
+  if (idsToCancel.length > 0) {
+    await appointmentModel.updateMany(
+      { _id: { $in: idsToCancel } },
+      { $set: { cancelled: true } },
+    );
+  }
+};
 
 // API to register user
 const registerUser = async (req, res) => {
@@ -19,12 +183,10 @@ const registerUser = async (req, res) => {
 
     //validating password length
     if (password.length < 8) {
-      return res
-        .status(400)
-        .json({
-          success: fail,
-          message: "Password must be at least 6 characters long",
-        });
+      return res.status(400).json({
+        success: fail,
+        message: "Password must be at least 6 characters long",
+      });
     }
 
     //validating email format
@@ -99,10 +261,18 @@ const getProfile = async (req, res) => {
 const updateProfile = async (req, res) => {
   try {
     const userId = req.userId;
-    const { name, phone, address, dob, gender } = req.body;
+    const { name, phone, address, dob, gender, imageUrl } = req.body;
     const imageFile = req.file;
 
-    if (!name && !phone && !address && !dob && !gender && !imageFile) {
+    if (
+      !name &&
+      !phone &&
+      !address &&
+      !dob &&
+      !gender &&
+      !imageFile &&
+      !imageUrl
+    ) {
       return res
         .status(400)
         .json({ message: "Please provide at least one field to update" });
@@ -125,6 +295,10 @@ const updateProfile = async (req, res) => {
       await userModel.findByIdAndUpdate(userId, {
         image: uploadResponse.secure_url,
       });
+    } else if (imageUrl && typeof imageUrl === "string") {
+      await userModel.findByIdAndUpdate(userId, {
+        image: imageUrl.trim(),
+      });
     }
 
     res.json({ success: true, message: "Profile updated successfully" });
@@ -137,9 +311,27 @@ const updateProfile = async (req, res) => {
 const bookAppointment = async (req, res) => {
   try {
     const userId = req.userId;
-    const { docId, slotDate, slotTime } = req.body;
+    const {
+      docId,
+      slotDate,
+      shiftId,
+      patientName,
+      patientAge,
+      symptoms,
+      medicalHistory,
+      symptomDurationDays,
+      painScale,
+      additionalNotes,
+    } = req.body;
 
-    if (!docId || !slotDate || !slotTime) {
+    if (
+      !docId ||
+      !slotDate ||
+      !shiftId ||
+      !patientName ||
+      !patientAge ||
+      !symptoms
+    ) {
       return res
         .status(400)
         .json({ message: "Please provide all required fields" });
@@ -162,24 +354,111 @@ const bookAppointment = async (req, res) => {
         .json({ message: "Doctor is not available for appointment" });
     }
 
-    let slots_booked = docData.slots_booked || {};
-
-    //checking for slot availability
-    if (slots_booked[slotDate] && slots_booked[slotDate].includes(slotTime)) {
+    if (isPastDate(slotDate)) {
       return res.status(400).json({
-        message: "Selected slot is already booked. Please choose another slot.",
+        success: false,
+        message: "Cannot book appointment for a past date.",
       });
-    } else {
-      //booking the slot
-      if (slots_booked[slotDate]) {
-        slots_booked[slotDate].push(slotTime);
-      } else {
-        slots_booked[slotDate] = [slotTime];
-      }
+    }
+
+    const normalizedShifts = normalizeDoctorShifts(docData.shifts);
+    const selectedShift = normalizedShifts.find(
+      (shift) => shift.id === shiftId,
+    );
+
+    if (!selectedShift) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid shift selected",
+      });
+    }
+
+    let triage = null;
+    let triageSource = "fallback";
+    let schedulerError = null;
+
+    try {
+      triage = await getSchedulerTriage({
+        patientName,
+        patientAge,
+        symptoms,
+        medicalHistory,
+        symptomDurationDays,
+        painScale,
+        additionalNotes,
+      });
+      triageSource = "medical_scheduler";
+    } catch (error) {
+      schedulerError = error?.message || "Medical scheduler unavailable";
+      const fallback = getSeverityAndTimeBlock({ symptoms });
+      triage = {
+        severityScore: fallback.severityScore,
+        durationMinutes: fallback.durationMinutes,
+        urgencyTag: fallback.severityScore >= 75 ? "URGENT" : "ROUTINE",
+        emergencyDetected: fallback.severityScore >= 90,
+        estimatedWaitMinutes: 0,
+        maxWaitHours: 0,
+        recommendedSpecialty: "",
+        matchedSymptoms: [],
+        redFlags: [],
+        scoreBreakdown: {},
+        schedulerPatientId: "",
+        schedulerMessage: "",
+      };
+    }
+
+    const existingAppointments = await appointmentModel
+      .find({
+        docId,
+        slotDate,
+        shiftId,
+        cancelled: false,
+      })
+      .select("slotTime durationMinutes queuePosition")
+      .sort({ queuePosition: 1, date: 1 });
+
+    const queueSlot = calculateQueueSlot({
+      shift: selectedShift,
+      existingAppointments,
+      durationMinutes: triage.durationMinutes,
+      slotDate,
+    });
+
+    if (!queueSlot.success || queueSlot.isFull) {
+      return res.status(400).json({
+        success: false,
+        message: "Selected shift is full. Please choose another shift.",
+      });
     }
 
     const docDataObj = docData.toObject();
     delete docDataObj.slots_booked;
+
+    let finalSlotTime = queueSlot.slotTime;
+    let finalSlotEndTime = queueSlot.slotEndTime;
+    let finalQueuePosition = queueSlot.queuePosition;
+
+    if (
+      triageSource === "medical_scheduler" &&
+      triage.estimatedSlotTime &&
+      canFitPreferredTime({
+        shift: selectedShift,
+        existingAppointments,
+        slotTime: triage.estimatedSlotTime,
+        durationMinutes: triage.durationMinutes,
+      })
+    ) {
+      finalSlotTime = triage.estimatedSlotTime;
+      const mins = parseHHMMToMinutes(triage.estimatedSlotTime);
+      finalSlotEndTime =
+        mins === null
+          ? queueSlot.slotEndTime
+          : `${String(Math.floor((mins + triage.durationMinutes) / 60)).padStart(2, "0")}:${String((mins + triage.durationMinutes) % 60).padStart(2, "0")}`;
+      finalQueuePosition = pickQueuePositionForTime(
+        existingAppointments,
+        triage.estimatedSlotTime,
+      );
+    }
 
     const appointment = new appointmentModel({
       userId,
@@ -188,15 +467,55 @@ const bookAppointment = async (req, res) => {
       docData: docDataObj,
       amount: docData.fees,
       slotDate,
-      slotTime,
+      slotTime: finalSlotTime,
+      shiftId,
+      shiftLabel: selectedShift.label,
+      queuePosition: finalQueuePosition,
+      durationMinutes: triage.durationMinutes,
+      severityScore: triage.severityScore,
+      urgencyTag: triage.urgencyTag || "ROUTINE",
+      emergencyDetected: Boolean(triage.emergencyDetected),
+      triageSource,
+      estimatedWaitMinutes: Number(triage.estimatedWaitMinutes) || 0,
+      maxWaitHours: Number(triage.maxWaitHours) || 0,
+      recommendedSpecialty: triage.recommendedSpecialty || "",
+      matchedSymptoms: Array.isArray(triage.matchedSymptoms)
+        ? triage.matchedSymptoms
+        : [],
+      redFlags: Array.isArray(triage.redFlags) ? triage.redFlags : [],
+      scoreBreakdown: triage.scoreBreakdown || {},
+      schedulerPatientId: triage.schedulerPatientId || "",
+      schedulerMessage: triage.schedulerMessage || "",
+      symptoms,
+      patientName,
+      patientAge: Number(patientAge),
       date: Date.now(),
     });
 
     await appointment.save();
-    await doctorModel.findByIdAndUpdate(docId, { slots_booked });
     res.json({
       success: true,
       message: "Appointment booked successfully",
+      appointmentTime: finalSlotTime,
+      appointmentEndTime: finalSlotEndTime,
+      queuePosition: finalQueuePosition,
+      shiftLabel: selectedShift.label,
+      durationMinutes: triage.durationMinutes,
+      severityScore: triage.severityScore,
+      urgencyTag: triage.urgencyTag || "ROUTINE",
+      emergencyDetected: Boolean(triage.emergencyDetected),
+      estimatedWaitMinutes: Number(triage.estimatedWaitMinutes) || 0,
+      maxWaitHours: Number(triage.maxWaitHours) || 0,
+      recommendedSpecialty: triage.recommendedSpecialty || "",
+      matchedSymptoms: Array.isArray(triage.matchedSymptoms)
+        ? triage.matchedSymptoms
+        : [],
+      redFlags: Array.isArray(triage.redFlags) ? triage.redFlags : [],
+      schedulerPatientId: triage.schedulerPatientId || "",
+      schedulerMessage: triage.schedulerMessage || "",
+      triageSource,
+      schedulerFallbackUsed: triageSource !== "medical_scheduler",
+      schedulerError,
       appointment,
     });
   } catch (error) {
@@ -209,6 +528,9 @@ const bookAppointment = async (req, res) => {
 const listAppointments = async (req, res) => {
   try {
     const userId = req.userId;
+
+    await cancelMissedAppointmentsForUser(userId);
+
     const appointments = await appointmentModel.find({ userId });
     res.json({ success: true, appointments });
   } catch (error) {
@@ -221,11 +543,42 @@ const listAppointments = async (req, res) => {
   }
 };
 
+// API to get a single appointment by ID for the authenticated user
+const getAppointmentById = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { id: appointmentId } = req.params;
+
+    const appointment = await appointmentModel.findById(appointmentId);
+
+    if (!appointment) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Appointment not found" });
+    }
+
+    if (appointment.userId !== userId) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Unauthorized access" });
+    }
+
+    res.json({ success: true, appointment });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching appointment",
+      error: error.message,
+    });
+  }
+};
+
 //API to cancel appointment
 const cancelAppointment = async (req, res) => {
   try {
     const userId = req.userId;
-    const { appointmentId } = req.body;
+    const { id: appointmentId } = req.params;
 
     if (!appointmentId) {
       return res
@@ -298,5 +651,6 @@ export {
   updateProfile,
   bookAppointment,
   listAppointments,
+  getAppointmentById,
   cancelAppointment,
 };
